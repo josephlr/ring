@@ -25,19 +25,34 @@
 //! [AEAD]: http://www-cse.ucsd.edu/~mihir/papers/oem.html
 //! [`crypto.cipher.AEAD`]: https://golang.org/pkg/crypto/cipher/#AEAD
 
-use {constant_time, error, init, poly1305, polyfill};
+use {aes_gcm, chacha20_poly1305, constant_time, error, init, poly1305, polyfill};
 
 pub use self::chacha20_poly1305::CHACHA20_POLY1305;
 pub use self::aes_gcm::{AES_128_GCM, AES_256_GCM};
+
+pub struct OpeningContext<'a> {
+    ctx: Context,
+    plaintext: &'a mut [u8],
+}
+
+impl<'a> Drop for OpeningContext<'a> {
+    fn drop(&mut self) {
+        // Zero out the plaintext so that it isn't accidentally leaked or used
+        // after verification fails. It would be safest if we could check the
+        // tag before decrypting, but some `open` implementations interleave
+        // authentication with decryption for performance.
+        for b in self.plaintext {
+            *b = 0;
+        }
+    }
+}
 
 /// A key for authenticating and decrypting (“opening”) AEAD-protected data.
 ///
 /// C analog: `EVP_AEAD_CTX` with direction `evp_aead_open`
 ///
 /// Go analog: [`crypto.cipher.AEAD`]
-pub struct OpeningKey {
-    key: Key,
-}
+pub struct OpeningKey(Key);
 
 impl OpeningKey {
     /// Create a new opening key.
@@ -51,11 +66,8 @@ impl OpeningKey {
     ///   [`crypto.aes.NewCipher`](https://golang.org/pkg/crypto/aes/#NewCipher)
     /// + [`crypto.cipher.NewGCM`](https://golang.org/pkg/crypto/cipher/#NewGCM)
     #[inline]
-    pub fn new(algorithm: &'static Algorithm, key_bytes: &[u8])
-               -> Result<OpeningKey, error::Unspecified> {
-        Ok(OpeningKey {
-            key: Key::new(algorithm, key_bytes)?,
-        })
+    pub fn new(algorithm: &'static Algorithm, key_bytes: &[u8]) -> Result<OpeningKey, error::Unspecified> {
+        Ok(OpeningKey(Key::new(algorithm, key_bytes)?))
     }
 
     /// The key's AEAD algorithm.
