@@ -30,9 +30,42 @@ use {aes_gcm, chacha20_poly1305, constant_time, error, init, poly1305, polyfill}
 pub use self::chacha20_poly1305::CHACHA20_POLY1305;
 pub use self::aes_gcm::{AES_128_GCM, AES_256_GCM};
 
+/// TODO: Add Docs and explain plaintext
 pub struct OpeningContext<'a> {
     ctx: Context,
     plaintext: &'a mut [u8],
+}
+
+impl<'a> OpeningContext<'a> {
+    #[inline]
+    fn new(key: &OpeningKey, nonce: &[u8]) -> Result<Self, error::Unspecified> {
+        Ok(OpeningContext {
+            ctx: key.0.init_ctx(nonce)?,
+            plaintext: &[],
+        })
+    }
+
+    #[inline]
+    pub fn add_ad(&mut self, ad: &[u8]) -> Result<(), error::Unspecified> {
+        self.ctx.as_ref().add_ad()
+    }
+
+    pub fn decrypt<'b: 'a>(&mut self, in_out: &'b mut [u8], shift: usize) -> Result<(), error::Unspecified> {
+        self.ctx.as_ref().decrypt(in_out, shift)?;
+        self.plaintext = in_out[shift..];
+        Ok(())
+    }
+
+    pub fn finish(self, tag: &[u8]) -> Result<&'a mut [u8], error::Unspecified> {
+        let expected_tag: [u8; MAX_TAG_LEN];
+        let tag_len = self.ctx.as_ref().get_tag(&expected_tag)?
+        constant_time::verify_slices_are_equal(&expected_tag[..tag_len], tag)?
+
+        // The tags match, so we do not need to clear the plaintext.
+        let plaintext = self.plaintext;
+        self.plaintext = &[];
+        Ok(plaintext)
+    }
 }
 
 impl<'a> Drop for OpeningContext<'a> {
@@ -66,7 +99,7 @@ impl OpeningKey {
     ///   [`crypto.aes.NewCipher`](https://golang.org/pkg/crypto/aes/#NewCipher)
     /// + [`crypto.cipher.NewGCM`](https://golang.org/pkg/crypto/cipher/#NewGCM)
     #[inline]
-    pub fn new(algorithm: &'static Algorithm, key_bytes: &[u8]) -> Result<OpeningKey, error::Unspecified> {
+    pub fn new(algorithm: &'static Algorithm, key_bytes: &[u8]) -> Result<Self, error::Unspecified> {
         Ok(OpeningKey(Key::new(algorithm, key_bytes)?))
     }
 
@@ -74,7 +107,7 @@ impl OpeningKey {
     ///
     /// C analog: `EVP_AEAD_CTX.aead`
     #[inline(always)]
-    pub fn algorithm(&self) -> &'static Algorithm { self.key.algorithm() }
+    pub fn algorithm(&self) -> &'static Algorithm { self.0.algorithm }
 }
 
 /// Authenticates and decrypts (“opens”) data in place.
@@ -129,32 +162,41 @@ pub fn open_in_place<'a>(key: &OpeningKey, nonce: &[u8], ad: &[u8],
                          in_prefix_len: usize,
                          ciphertext_and_tag_modified_in_place: &'a mut [u8])
                          -> Result<&'a mut [u8], error::Unspecified> {
-    let nonce = slice_as_array_ref!(nonce, NONCE_LEN)?;
-    let ciphertext_and_tag_len =
-        ciphertext_and_tag_modified_in_place.len()
-                .checked_sub(in_prefix_len).ok_or(error::Unspecified)?;
-    let ciphertext_len =
-        ciphertext_and_tag_len.checked_sub(TAG_LEN).ok_or(error::Unspecified)?;
-    check_per_nonce_max_bytes(key.key.algorithm, ciphertext_len)?;
-    let (in_out, received_tag) =
-        ciphertext_and_tag_modified_in_place
-            .split_at_mut(in_prefix_len + ciphertext_len);
-    let mut calculated_tag = [0u8; TAG_LEN];
-    (key.key.algorithm.open)(&key.key.ctx_buf, nonce, &ad, in_prefix_len,
-                             in_out, &mut calculated_tag)?;
-    if constant_time::verify_slices_are_equal(&calculated_tag, received_tag)
-            .is_err() {
-        // Zero out the plaintext so that it isn't accidentally leaked or used
-        // after verification fails. It would be safest if we could check the
-        // tag before decrypting, but some `open` implementations interleave
-        // authentication with decryption for performance.
-        for b in &mut in_out[..ciphertext_len] {
-            *b = 0;
-        }
-        return Err(error::Unspecified);
+    let ctx = OpeningContext::new(key, nonce)?;
+    ctx.add_ad(ad)?;
+
+    let in_out_len = ciphertext_and_tag_modified_in_place.len().checked_sub(key.algorithm().tag_len()).ok_or(error::Unspecified)?;
+    let (in_out, received_tag) = ciphertext_and_tag_modified_in_place.split_at_mut(in_out_len);
+
+    let plaintext = ctx.decrypt(in_out, in_prefix_len)?;
+    ctx.finish(received_tag)?;
+    Ok(plaintext)
+}
+
+/// TODO: Add Docs
+pub struct SealingContext(Context);
+
+impl SealingContext {
+    #[inline]
+    pub fn new(key: &SealingKey, nonce: &[u8]) -> Result<Self, error::Unspecified> {
+        Ok(SealingContext(key.0.init_ctx()?))
     }
-    // `ciphertext_len` is also the plaintext length.
-    Ok(&mut in_out[..ciphertext_len])
+
+    #[inline]
+    pub fn add_ad(&mut self, ad: &[u8]) -> Result<(), error::Unspecified> {
+        self.0.as_ref().add_ad()
+    }
+
+    pub fn encrypt(&mut self, in_out: &mut [u8], shift: usize) -> Result<&[u8], error::Unspecified> {
+        self.0.as_ref().encrypt(in_out, shift)?;
+        Ok(in_out[shift..])
+    }
+
+    pub fn finish(self) -> Result<Tag, error::Unspecified> {
+        let mut tag = Tag{[0; MAX_TAG_LEN], 0};
+        tag.len = self.0.as_ref().get_tag(&tag.data)?;
+        Ok(tag)
+    }
 }
 
 /// A key for encrypting and signing (“sealing”) data.
@@ -162,9 +204,7 @@ pub fn open_in_place<'a>(key: &OpeningKey, nonce: &[u8], ad: &[u8],
 /// C analog: `EVP_AEAD_CTX` with direction `evp_aead_seal`.
 ///
 /// Go analog: [`AEAD`](https://golang.org/pkg/crypto/cipher/#AEAD)
-pub struct SealingKey {
-    key: Key,
-}
+pub struct SealingKey(Key);
 
 impl SealingKey {
     /// C analogs: `EVP_AEAD_CTX_init_with_direction` with direction
@@ -174,18 +214,15 @@ impl SealingKey {
     ///   [`crypto.aes.NewCipher`](https://golang.org/pkg/crypto/aes/#NewCipher)
     /// + [`crypto.cipher.NewGCM`](https://golang.org/pkg/crypto/cipher/#NewGCM)
     #[inline]
-    pub fn new(algorithm: &'static Algorithm, key_bytes: &[u8])
-               -> Result<SealingKey, error::Unspecified> {
-        Ok(SealingKey {
-            key: Key::new(algorithm, key_bytes)?,
-        })
+    pub fn new(algorithm: &'static Algorithm, key_bytes: &[u8]) -> Result<Self, error::Unspecified> {
+        Ok(SealingKey(Key::new(algorithm, key_bytes)?))
     }
 
     /// The key's AEAD algorithm.
     ///
     /// C analog: `EVP_AEAD_CTX.aead`
     #[inline(always)]
-    pub fn algorithm(&self) -> &'static Algorithm { self.key.algorithm() }
+    pub fn algorithm(&self) -> &'static Algorithm { self.0.algorithm }
 }
 
 /// Encrypts and signs (“seals”) data in place.
@@ -212,56 +249,76 @@ impl SealingKey {
 pub fn seal_in_place(key: &SealingKey, nonce: &[u8], ad: &[u8],
                      in_out: &mut [u8], out_suffix_capacity: usize)
                      -> Result<usize, error::Unspecified> {
-    if out_suffix_capacity < key.key.algorithm.tag_len() {
-        return Err(error::Unspecified);
-    }
-    let nonce = slice_as_array_ref!(nonce, NONCE_LEN)?;
-    let in_out_len =
-        in_out.len().checked_sub(out_suffix_capacity).ok_or(error::Unspecified)?;
-    check_per_nonce_max_bytes(key.key.algorithm, in_out_len)?;
+    let ctx = SealingContext::new(key, nonce)?;
+    ctx.add_ad(ad)?;
+
+    let in_out_len = in_out.len().checked_sub(out_suffix_capacity).ok_or(error::Unspecified)?;
     let (in_out, tag_out) = in_out.split_at_mut(in_out_len);
-    let tag_out = slice_as_array_ref_mut!(tag_out, TAG_LEN)?;
-    (key.key.algorithm.seal)(&key.key.ctx_buf, nonce, ad, in_out, tag_out)?;
-    Ok(in_out_len + TAG_LEN)
+
+    ctx.encrypt(in_out, 0)?;
+    let tag_len = ctx.0.as_ref().get_tag(tag_out)?;
+    Ok(in_out_len + tag_len)
 }
 
-/// `OpeningKey` and `SealingKey` are type-safety wrappers around `Key`, which
-/// does all the actual work via the C AEAD interface.
-///
-/// C analog: `EVP_AEAD_CTX`
+// TODO: Explain Tag
+struct Tag {
+    data: [u8; MAX_TAG_LEN],
+    len: usize,
+}
+
+impl AsRef<[u8]> for Tag {
+    #[inline] fn as_ref(&self) -> &[u8] { self.data[:self.len] }
+}
+
+// TODO: Explain Context
+enum Context {
+    AesGcm(aes_gcm::Context),
+    // ChaCha(chacha20_poly1305::Context),
+}
+
+trait ContextTrait {
+    fn add_ad(&mut self, ad: &[u8]) -> Result<(), error::Unspecified>;
+    fn encrypt(&mut self, in_out: &mut [u8]) -> Result<(), error::Unspecified>;
+    fn decrypt(&mut self, in_out: &mut [u8]) -> Result<(), error::Unspecified>;
+    fn get_tag(self, tag: &mut [u8]) -> Result<usize, error::Unspecified>;
+}
+
+impl AsRef<dyn ContextTrait> for Context {
+    #[inline]
+    fn as_ref(&self) -> &dyn ContextTrait {
+        match self {
+            Context::AesGcm(ctx) => ctx,
+            // Context::ChaCha(ctx) => ctx,
+        }
+    }
+}
+
+// TODO: Explain Key
 struct Key {
-    ctx_buf: [u64; KEY_CTX_BUF_ELEMS],
+    key_enum: KeyEnum,
     algorithm: &'static Algorithm,
 }
 
-const KEY_CTX_BUF_ELEMS: usize = (KEY_CTX_BUF_LEN + 7) / 8;
-
-// Keep this in sync with `aead_aes_gcm_ctx` in e_aes.c.
-const KEY_CTX_BUF_LEN: usize = self::aes_gcm::AES_KEY_CTX_BUF_LEN;
+enum KeyEnum {
+    AesGcm(aes_gcm::Key),
+    // ChaCha(chacha20_poly1305::Key),
+}
 
 impl Key {
+    #[inline]
     fn new(algorithm: &'static Algorithm, key_bytes: &[u8]) -> Result<Self, error::Unspecified> {
-        if key_bytes.len() != algorithm.key_len() {
-            return Err(error::Unspecified);
-        }
-
-        let mut r = Key {
-            algorithm,
-            ctx_buf: [0; KEY_CTX_BUF_ELEMS],
-        };
-
-        init::init_once();
-        {
-            let ctx_buf_bytes = polyfill::slice::u64_as_u8_mut(&mut r.ctx_buf);
-            (r.algorithm.init)(ctx_buf_bytes, key_bytes)?;
-        }
-
-        Ok(r)
+        Ok(Key {
+            key_enum: algorithm.algorithm.init_key()?,
+            algorithm: &'static Algorithm,
+        })
     }
-
-    /// The key's AEAD algorithm.
-    #[inline(always)]
-    fn algorithm(&self) -> &'static Algorithm { self.algorithm }
+    #[inline]
+    fn init_ctx(&self, nonce: &[u8]) -> Result<Context, error::Unspecified> {
+        match self.key_enum {
+            KeyEnum::AesGcm(key) => Context::AesGcm(key.init_ctx()?),
+            // KeyEnum::ChaCha(key) => Context::ChaCha(key.init_ctx()?),
+        }
+    }
 }
 
 /// An AEAD Algorithm.
@@ -271,30 +328,15 @@ impl Key {
 /// Go analog:
 ///     [`crypto.cipher.AEAD`](https://golang.org/pkg/crypto/cipher/#AEAD)
 pub struct Algorithm {
-    init: fn(ctx_buf: &mut [u8], key: &[u8]) -> Result<(), error::Unspecified>,
-
-    seal: fn(ctx: &[u64; KEY_CTX_BUF_ELEMS], nonce: &[u8; NONCE_LEN], ad: &[u8],
-             in_out: &mut [u8], tag_out: &mut [u8; TAG_LEN])
-             -> Result<(), error::Unspecified>,
-    open: fn(ctx: &[u64; KEY_CTX_BUF_ELEMS], nonce: &[u8; NONCE_LEN],
-             ad: &[u8], in_prefix_len: usize, in_out: &mut [u8],
-             tag_out: &mut [u8; TAG_LEN]) -> Result<(), error::Unspecified>,
-
+    algorithm: &'static dyn AlgorithmTrait,
     key_len: usize,
+    tag_len: usize,
+    nonce_len: usize,
     id: AlgorithmID,
-
-    /// Use `max_input_len!()` to initialize this.
-    // TODO: Make this `usize`.
-    max_input_len: u64,
 }
 
-/// TODO: Make this a `const fn` when those become stable.
-macro_rules! max_input_len {
-    ($block_len:expr, $overhead_blocks_per_nonce:expr) => {
-        // Each of our AEADs use a 32-bit block counter so the maximum is the
-        // largest input that will not overflow the counter.
-        (((1u64 << 32) - $overhead_blocks_per_nonce) * $block_len)
-    }
+trait AlgorithmTrait {
+    fn init_key(&self, key_bytes: &[u8]) -> Result<KeyEnum, ()>;
 }
 
 impl Algorithm {
@@ -313,7 +355,7 @@ impl Algorithm {
     /// Go analog:
     ///   [`crypto.cipher.AEAD.Overhead`](https://golang.org/pkg/crypto/cipher/#AEAD)
     #[inline(always)]
-    pub fn tag_len(&self) -> usize { TAG_LEN }
+    pub fn tag_len(&self) -> usize { self.tag_len }
 
     /// The length of the nonces.
     ///
@@ -322,7 +364,7 @@ impl Algorithm {
     /// Go analog:
     ///   [`crypto.cipher.AEAD.NonceSize`](https://golang.org/pkg/crypto/cipher/#AEAD)
     #[inline(always)]
-    pub fn nonce_len(&self) -> usize { NONCE_LEN }
+    pub fn nonce_len(&self) -> usize { self.nonce_len }
 }
 
 derive_debug_from_field!(Algorithm, id);
@@ -331,7 +373,7 @@ derive_debug_from_field!(Algorithm, id);
 enum AlgorithmID {
     AES_128_GCM,
     AES_256_GCM,
-    CHACHA20_POLY1305,
+    // CHACHA20_POLY1305,
 }
 
 impl PartialEq for Algorithm {
@@ -341,21 +383,15 @@ impl PartialEq for Algorithm {
 impl Eq for Algorithm {}
 
 /// The maximum length of a tag for the algorithms in this module.
-pub const MAX_TAG_LEN: usize = TAG_LEN;
+pub const MAX_TAG_LEN: usize = AES_128_GCM.tag_len;
 
-// All the AEADs we support use 128-bit tags.
-const TAG_LEN: usize = poly1305::TAG_LEN;
-
-// All the AEADs we support use 96-bit nonces.
-const NONCE_LEN: usize = 96 / 8;
-
-
-fn check_per_nonce_max_bytes(alg: &Algorithm, in_out_len: usize)
-                             -> Result<(), error::Unspecified> {
-    if polyfill::u64_from_usize(in_out_len) > alg.max_input_len {
-        return Err(error::Unspecified);
+/// All of our AEADs use a 32-bit block counter so the maximum input length is
+/// the largest input that will not overflow the counter.
+/// TODO: Make this a `const fn` when those become stable.
+macro_rules! max_input_len {
+    ($block_len:expr, $overhead_blocks_per_nonce:expr) => {
+        (((1u64 << 32) - $overhead_blocks_per_nonce as u64) * $block_len as u64)
     }
-    Ok(())
 }
 
 pub mod chacha20_poly1305_openssh;
