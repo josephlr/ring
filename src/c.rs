@@ -22,9 +22,16 @@
 
 // Keep in sync with the checks in base.h that verify these assumptions.
 
+#![allow(dead_code)]
+
 pub(crate) type int = i32;
 pub(crate) type uint = u32;
 pub(crate) type size_t = usize;
+
+#[cfg(any(target_pointer_width = "32", target_pointer_width = "16"))]
+pub(crate) type ulong = u32;
+#[cfg(target_pointer_width = "64")]
+pub(crate) type ulong = u64;
 
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
@@ -46,6 +53,11 @@ mod tests {
             let x: c::size_t = 1;
             let _x: libc::size_t = x;
             let _x: usize = x;
+        }
+
+        {
+            let x: c::ulong = 1;
+            let _x: libc::c_ulong = x;
         }
     }
 }
